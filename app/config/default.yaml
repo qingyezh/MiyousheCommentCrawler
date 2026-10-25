@@ -14,8 +14,8 @@ http:
 
 # 请求间隔（毫秒）
 intervals:
-  commentMs: 1200   # 评论区：1.2s
-  userMs: 800       # 主页：0.8s
+  commentMs: 1000   # 评论区：1.2s
+  userMs: 900       # 主页：0.8s
 
 pools:
   comments:
@@ -33,7 +33,7 @@ replies:
 users:
   enabled: false          # 默认关闭主页爬取；CLI --users 可打开
   levelMin: 2
-  maxUsers: 2000
+  maxUsers: 50000
 
 io:
   batchSize: 50

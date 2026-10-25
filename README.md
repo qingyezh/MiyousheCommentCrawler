@@ -23,7 +23,7 @@ CLI 参数 > `app/config/config.yaml` 的 `crawl` 节 > `default.yaml`
 ```yaml
 cookie: "..."
 crawl:
-  url: "https://www.miyoushe.com/ys/article/79085282"
+  url: "https://www.miyoushe.com/ys/article/xxxxxx"
   users: true
   includeChild: true
   maxRootPages: 0
@@ -35,14 +35,14 @@ crawl:
 
 稳定目录：`app/data/results/<帖子ID>/`
 
-| 文件 | 说明 |
-|------|------|
-| `帖子基本信息.csv` | 帖子标题/作者/统计等 |
-| `评论数据.csv` | 含 `评论类型` = root/child；**始终统计去重用户数** |
-| `用户数据.csv` | 去重用户 + 各游戏等级 + 性别/IP/注册时间 |
-| `总结统计.csv` | 评论总览 + IP/性别 + 各游戏游玩率 |
-| `summary.json` | 机器可读总结 |
-| `analysis/` | 分析产物：`analysis.html`、`分析汇总.csv`、`charts/*.svg` |
+| 文件                 | 说明                                                            |
+| -------------------- | --------------------------------------------------------------- |
+| `帖子基本信息.csv` | 帖子标题/作者/统计等                                            |
+| `评论数据.csv`     | 含 `评论类型` = root/child；**始终统计去重用户数**      |
+| `用户数据.csv`     | 去重用户 + 各游戏等级 + 性别/IP/注册时间                        |
+| `总结统计.csv`     | 评论总览 + IP/性别 + 各游戏游玩率                               |
+| `summary.json`     | 机器可读总结                                                    |
+| `analysis/`        | 分析产物：`analysis.html`、`分析汇总.csv`、`charts/*.svg` |
 
 CSV 均为 UTF-8 BOM + 中文列名。同时会在 `app/data/runs/<runId>/final/` 归档，并生成 `report.xlsx`。
 
@@ -57,6 +57,24 @@ CSV 均为 UTF-8 BOM + 中文列名。同时会在 `app/data/runs/<runId>/final/
 - 打开 `analysis/analysis.html` 可一页总览（嵌入 PNG）
 
 `总结统计.csv` / `分析汇总.csv` 同时写入 `_0` 与 `_1` 两套百分比。
+
+## 中途快照分析
+
+爬取进行中可另开终端生成临时分析（**不改 checkpoint**，不影响 crawl/resume）：
+
+```powershell
+pnpm run partial
+# 或
+pnpm run partial -- --checkpoint app/data/checkpoint.json
+```
+
+输出目录：
+
+```text
+app/data/results/<帖子ID>/analysis-partial/
+```
+
+可与爬取并行；从当前 `runs/<runId>/batches/` 批次只读分析。
 
 ## 分析命令
 
@@ -118,12 +136,16 @@ pnpm run analysis -- --id 79085282             # 对已有数据分析
 
 - 评论区：`1.2s`（`intervals.commentMs`）
 - 主页：`0.8s`（`intervals.userMs`）
-- 遇到限流（HTTP 429/503、频率类文案、部分 retcode）按**斐波那契**退避重试：  
-  `1s, 1s, 2s, 3s, 5s, 8s`（`rateLimitBaseMs=1000`，最多 `rateLimitMaxRetries=6` 次）
+- 限流处理：
+  1. 一次「命中限流 → 重试成功或最终失败」只记 **1 次限流事件**
+  2. 每次事件：该池请求间隔 **+50ms**，累计额外间隔上限 **1500ms**
+  3. 事件内重试仍用斐波那契等待（最多 `rateLimitMaxRetries=6` 次）
+  4. **每 3 次事件**暂停：5 分钟，其后每次 +3 分钟，封顶 **20 分钟**
+
 
 ## 日志
 
 - 按天：`app/log/app-YYYY-MM-DD.log`（按配置时区命名）
 - 启动时把超过 `log.historyDays`（默认 3 天）的旧日志挪到 `app/log/history/`
-- 时间偏移：`log.timezoneOffset`，默认 `UTC+8`  
+- 时间偏移：`log.timezoneOffset`，默认 `UTC+8`
   合法值：`UTC` / `UTC+0` ~ `UTC+23`；非法值自动回落 `UTC`

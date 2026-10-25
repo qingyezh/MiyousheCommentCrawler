@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, projectRootFrom } from './config/loader.js';
 import { createLogger, rotateHistory } from './logger/index.js';
 import { runCrawl, runReportOnly, SimpleCrawlController, type CrawlContext } from './pipeline/crawler.js';
-import { runAnalysisById } from './pipeline/analysis.js';
+import { runAnalysisById, runPartialAnalysis } from './pipeline/analysis.js';
 import { startControlServer } from './core/control.js';
 import type { CrawlOptions } from './types.js';
 
@@ -160,22 +160,34 @@ async function main() {
     const controller = makeController();
     const ctx: CrawlContext = { config, logger, projectRoot, options };
 
-    // SIGINT/SIGTERM graceful
+    // SIGINT/SIGTERM graceful：主动中止 → checkpoint 暂停 + 退出码 130
     let stopping = false;
     const onSignal = (sig: string) => {
-      if (stopping) process.exit(1);
+      if (stopping) process.exit(130);
       stopping = true;
       logger.warn({ sig, msg: 'signal_pause_flush_exit' });
       controller.abort(sig);
       setTimeout(() => {
         logger.error({ msg: 'force_exit_after_signal' });
-        process.exit(1);
-      }, 8000).unref();
+        process.exit(130);
+      }, 15000).unref();
     };
     process.on('SIGINT', () => onSignal('SIGINT'));
     process.on('SIGTERM', () => onSignal('SIGTERM'));
 
-    await runCrawl(ctx, controller);
+    try {
+      await runCrawl(ctx, controller);
+    } catch (e) {
+      const aborted =
+        controller.isAborted ||
+        (e instanceof Error && (e.message === 'pool_aborted' || e.message.includes('abort')));
+      if (aborted) {
+        logger.warn({ msg: 'crawl_paused_use_resume' });
+        if (control) await control.close();
+        process.exit(130);
+      }
+      throw e;
+    }
     if (control) await control.close();
     logger.info({ msg: 'cli_done' });
     return;
@@ -203,7 +215,28 @@ async function main() {
     }
     logger.info({ url: options.url, checkpoint, msg: 'resume_start' });
     const controller = makeController();
-    await runCrawl({ config, logger, projectRoot, options }, controller);
+    let stopping = false;
+    const onSignal = (sig: string) => {
+      if (stopping) process.exit(130);
+      stopping = true;
+      logger.warn({ sig, msg: 'signal_pause_flush_exit' });
+      controller.abort(sig);
+      setTimeout(() => process.exit(130), 15000).unref();
+    };
+    process.on('SIGINT', () => onSignal('SIGINT'));
+    process.on('SIGTERM', () => onSignal('SIGTERM'));
+    try {
+      await runCrawl({ config, logger, projectRoot, options }, controller);
+    } catch (e) {
+      const aborted =
+        controller.isAborted ||
+        (e instanceof Error && (e.message === 'pool_aborted' || e.message.includes('abort')));
+      if (aborted) {
+        if (control) await control.close();
+        process.exit(130);
+      }
+      throw e;
+    }
     if (control) await control.close();
     return;
   }
@@ -251,8 +284,28 @@ async function main() {
     return;
   }
 
+  if (cmd === 'partial' || cmd === 'snap') {
+    const ana = await runPartialAnalysis({
+      projectRoot,
+      dataDir,
+      logger,
+      levelMin: config.users.levelMin,
+      checkpointPath: str(flags.checkpoint),
+    });
+    logger.info({
+      outDir: ana.outDir,
+      uniqueCommenters: ana.uniqueCommenters,
+      charts: ana.charts.length,
+      msg: 'partial_analysis_cli_done',
+    });
+    console.log(`中途快照分析完成（未改断点）: ${ana.outDir}`);
+    console.log(`图表目录: ${path.join(ana.outDir, 'charts')}`);
+    if (control) await control.close();
+    return;
+  }
+
   logger.error({ cmd, msg: 'unknown_cmd' });
-  console.error('未知命令。可用: crawl | resume | report | analysis | clean');
+  console.error('未知命令。可用: crawl | resume | report | analysis | partial | clean');
   process.exit(2);
 }
 

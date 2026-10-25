@@ -14,6 +14,8 @@ export interface AnalysisInput {
   users: UserRecord[];
   games: GameDictItem[];
   levelMin: number;
+  /** 输出子目录，默认 analysis；快照可用 analysis-partial */
+  outSubdir?: string;
 }
 
 export interface AnalysisResult {
@@ -366,7 +368,7 @@ async function saveChart(
 // ---------- 主分析 ----------
 
 export async function runAnalysis(input: AnalysisInput, logger: Logger): Promise<AnalysisResult> {
-  const outDir = path.join(input.resultsDir, 'analysis');
+  const outDir = path.join(input.resultsDir, input.outSubdir ?? 'analysis');
   const chartsDir = path.join(outDir, 'charts');
   const svgDir = path.join(chartsDir, 'svg');
   await fsp.mkdir(svgDir, { recursive: true });
@@ -771,3 +773,136 @@ ${chartsHtml}
 }
 
 export { genderLabel, parseGenderRaw };
+
+/**
+ * 中途快照分析：读取当前 run 批次临时结果出图/统计。
+ * - 不修改 checkpoint
+ * - 可与 crawl/resume 并行（只读 batches）
+ * - 输出到 results/<postId>/analysis-partial/
+ */
+export async function runPartialAnalysis(
+  opts: { projectRoot: string; dataDir: string; logger: Logger; levelMin?: number; checkpointPath?: string },
+): Promise<AnalysisResult> {
+  const { projectRoot, dataDir, logger } = opts;
+  const cpPath = opts.checkpointPath ?? path.join(dataDir, 'checkpoint.json');
+  if (!fs.existsSync(cpPath)) {
+    throw new Error(`找不到 checkpoint: ${cpPath}，请先启动 crawl`);
+  }
+  const cp = JSON.parse(await fsp.readFile(cpPath, 'utf8')) as {
+    runId: string;
+    postId: string;
+    url?: string;
+    phase: string;
+    comments?: { written?: number; rootLastId?: string | number };
+    users?: { done?: number };
+  };
+  const runDir = path.join(dataDir, 'runs', cp.runId);
+  const commentsDir = path.join(runDir, 'batches', 'comments');
+  const usersDir = path.join(runDir, 'batches', 'users');
+  const finalDir = path.join(runDir, 'final');
+  const resultsDir = path.join(dataDir, 'results', cp.postId);
+
+  logger.info({
+    runId: cp.runId,
+    postId: cp.postId,
+    phase: cp.phase,
+    commentsWritten: cp.comments?.written,
+    usersDone: cp.users?.done,
+    msg: 'partial_analysis_start',
+  });
+
+  const comments: CommentRecord[] = [];
+  await streamJsonlDir<CommentRecord>(commentsDir, 'comments-batch-', (c) => {
+    if (c?.uid) comments.push(c);
+  });
+  const users: UserRecord[] = [];
+  await streamJsonlDir<UserRecord>(usersDir, 'users-batch-', (u) => {
+    if (u?.uid) users.push(u);
+  });
+
+  let post: PostMeta | null = null;
+  const postJson = path.join(finalDir, 'post_meta.json');
+  if (fs.existsSync(postJson)) {
+    post = JSON.parse(await fsp.readFile(postJson, 'utf8')) as PostMeta;
+  }
+  if (!post) {
+    post = {
+      post_id: cp.postId,
+      game_id: 0,
+      f_forum_id: 0,
+      uid: '',
+      subject: `中途快照 ${cp.postId}`,
+      content: '',
+      cover: null,
+      created_at: 0,
+      reply_time: null,
+      max_floor: 0,
+      view_type: 0,
+      is_official: false,
+      stats: {},
+    };
+  }
+
+  let games: GameDictItem[] = [];
+  const gamesPath = path.join(finalDir, 'games.json');
+  if (fs.existsSync(gamesPath)) {
+    try {
+      games = JSON.parse(await fsp.readFile(gamesPath, 'utf8')) as GameDictItem[];
+    } catch {
+      games = [];
+    }
+  }
+
+  const outDir = path.join(resultsDir, 'analysis-partial');
+  logger.info({
+    comments: comments.length,
+    users: users.length,
+    outDir,
+    msg: 'partial_analysis_loaded_batches',
+  });
+
+  return runAnalysis(
+    {
+      resultsDir,
+      post,
+      comments,
+      users,
+      games,
+      levelMin: opts.levelMin ?? 2,
+      outSubdir: 'analysis-partial',
+    },
+    logger,
+  );
+}
+
+async function streamJsonlDir<T>(
+  dir: string,
+  prefix: string,
+  onItem: (x: T) => void,
+): Promise<void> {
+  if (!fs.existsSync(dir)) return;
+  const files = fs
+    .readdirSync(dir)
+    .filter((f) => f.startsWith(prefix) && f.endsWith('.jsonl'))
+    .sort();
+  const readline = await import('node:readline');
+  for (const file of files) {
+    const full = path.join(dir, file);
+    let stream: fs.ReadStream;
+    try {
+      stream = fs.createReadStream(full, { encoding: 'utf8' });
+    } catch {
+      continue;
+    }
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      try {
+        onItem(JSON.parse(line) as T);
+      } catch {
+        /* 并发写入中的半行，跳过 */
+      }
+    }
+    rl.close();
+  }
+}

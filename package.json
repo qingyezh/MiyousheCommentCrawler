@@ -11,6 +11,7 @@
     "resume": "pnpm run build && node app/dist/index.js resume",
     "report": "pnpm run build && node app/dist/index.js report",
     "analysis": "pnpm run build && node app/dist/index.js analysis",
+    "partial": "pnpm run build && node app/dist/index.js partial",
     "clean:data": "pnpm run build && node app/dist/app/scripts/clean.js",
     "smoke": "pnpm run build && node app/dist/app/scripts/smoke.js"
   },

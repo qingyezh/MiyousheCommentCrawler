@@ -1,7 +1,8 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fetch, Agent } from 'undici';
 import type { Logger } from 'pino';
-import { RateLimiter } from './rate.js';
+import { RateLimiter, RateLimitEpisodes } from './rate.js';
+import type { AdaptiveUserLimiter } from './adaptiveUserLimiter.js';
 
 export interface HttpClientOptions {
   cookie: string;
@@ -13,6 +14,8 @@ export interface HttpClientOptions {
   rateLimitBaseMs?: number;
   commentLimiter: RateLimiter;
   userLimiter: RateLimiter;
+  /** 用户池自适应并发（可选）：限流时回退/暂停 */
+  adaptiveUser?: AdaptiveUserLimiter | null;
   logger: Logger;
 }
 
@@ -35,7 +38,6 @@ export function isRateLimited(status: number, retcode: number, message?: string)
   if (msg.includes('too many') || msg.includes('rate') || msg.includes('频繁') || msg.includes('限流')) {
     return true;
   }
-  // 米游社常见限流/异常可重试业务码
   if (retcode === -502 || retcode === -1001) return true;
   return false;
 }
@@ -46,8 +48,15 @@ export class HttpClient {
     headersTimeout: 30_000,
     bodyTimeout: 30_000,
   });
+  private episodes: RateLimitEpisodes;
 
-  constructor(private opts: HttpClientOptions) {}
+  constructor(private opts: HttpClientOptions) {
+    this.episodes = new RateLimitEpisodes([opts.commentLimiter, opts.userLimiter], opts.logger);
+  }
+
+  get rateEpisodes() {
+    return this.episodes;
+  }
 
   private headers(referer: string): Record<string, string> {
     return {
@@ -68,6 +77,7 @@ export class HttpClient {
     const rateMax = this.opts.rateLimitMaxRetries ?? 6;
     const rateBase = this.opts.rateLimitBaseMs ?? 1000;
     let rateAttempt = 0;
+    let hitRateLimit = false;
 
     for (let attempt = 1; attempt <= this.opts.retry + 1 + rateMax; attempt++) {
       await limiter.wait();
@@ -76,7 +86,9 @@ export class HttpClient {
         const res = await fetch(url, {
           method: 'GET',
           headers: this.headers(
-            new URL(url).origin.includes('miyoushe') ? 'https://www.miyoushe.com/' : 'https://www.mihoyo.com/',
+            new URL(url).origin.includes('miyoushe')
+              ? 'https://www.miyoushe.com/'
+              : 'https://www.mihoyo.com/',
           ),
           dispatcher: this.agent,
           signal: AbortSignal.timeout(this.opts.timeoutMs),
@@ -105,6 +117,7 @@ export class HttpClient {
         });
 
         if (isRateLimited(res.status, retcode, body?.message)) {
+          hitRateLimit = true;
           rateAttempt++;
           if (rateAttempt > rateMax) {
             this.opts.logger.error({
@@ -116,6 +129,16 @@ export class HttpClient {
               path: safePath(url),
               msg: 'http_rate_limit_exhausted',
             });
+            // 整次「限流→重试失败」记 1 次事件
+            await this.episodes.onEpisode(limiter, {
+              outcome: 'exhausted',
+              status: res.status,
+              retcode,
+              retries: rateAttempt - 1,
+            });
+            if (this.opts.adaptiveUser && limiter === this.opts.userLimiter) {
+              await this.opts.adaptiveUser.onRateLimited({ outcome: 'exhausted', status: res.status, retcode });
+            }
             lastErr = new Error(`限流重试耗尽 status=${res.status} retcode=${retcode}`);
             break;
           }
@@ -135,8 +158,20 @@ export class HttpClient {
           continue;
         }
 
+        if (hitRateLimit) {
+          // 本次请求曾限流但最终成功 → 记 1 次事件
+          await this.episodes.onEpisode(limiter, {
+            outcome: 'recovered',
+            status: res.status,
+            retcode,
+            retries: rateAttempt,
+          });
+          if (this.opts.adaptiveUser && limiter === this.opts.userLimiter) {
+            await this.opts.adaptiveUser.onRateLimited({ outcome: 'recovered', status: res.status, retcode });
+          }
+        }
+
         if (retcode !== 0) {
-          // 非限流业务错误，部分可重试
           if (retcode === -100) {
             const wait = this.opts.backoffBaseMs * 2 ** Math.min(attempt, 5);
             this.opts.logger.warn({

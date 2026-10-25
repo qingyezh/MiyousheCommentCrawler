@@ -20,6 +20,8 @@ import { parseMiyousheUrl, UidSet } from '../core/util.js';
 import { writeReport } from './report.js';
 import { writeChineseCsvBundle } from './exportCsv.js';
 import { runAnalysisById } from './analysis.js';
+import { logProgress } from '../logger/index.js';
+import { AdaptiveUserLimiter } from '../core/adaptiveUserLimiter.js';
 import type {
   AppConfig,
   Checkpoint,
@@ -158,12 +160,29 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
   // 续爬：优先复用 checkpoint 中的 runId，避免批次目录对不上
   let runId = options.runId ?? newRunId();
   let resumeLoaded: Checkpoint | null = null;
-  if (options.resumeCheckpoint) {
-    resumeLoaded = await store.load();
-    if (resumeLoaded?.runId) {
+  const existing = await store.load();
+  // 显式 resume，或 crawl 时发现同帖未完成 checkpoint → 自动续爬（防止误操作从 0 重来）
+  const forceRestart = process.argv.includes('--force-restart');
+  const shouldResume =
+    Boolean(options.resumeCheckpoint) ||
+    (!forceRestart &&
+      existing &&
+      existing.phase !== 'done' &&
+      existing.postId === parsedPostId &&
+      (existing.comments.rootLastId !== '0' || existing.comments.written > 0));
+  if (shouldResume && existing) {
+    resumeLoaded = existing;
+    if (resumeLoaded.runId) {
       runId = options.runId ?? resumeLoaded.runId;
-      logger.info({ runId, postId: resumeLoaded.postId, phase: resumeLoaded.phase, msg: 'resume_run_id_restored' });
     }
+    logger.warn({
+      runId,
+      postId: resumeLoaded.postId,
+      phase: resumeLoaded.phase,
+      rootLastId: resumeLoaded.comments.rootLastId,
+      written: resumeLoaded.comments.written,
+      msg: 'auto_resume_from_checkpoint',
+    });
   }
 
   const runDir = path.join(dataDir, 'runs', runId);
@@ -211,6 +230,14 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
 
   const commentLimiter = new RateLimiter(config.intervals.commentMs);
   const userLimiter = new RateLimiter(config.intervals.userMs);
+  // 用户阶段保守自适应：初始 2 人，限流回退 1 人，再限流暂停 3 分钟后恢复
+  const adaptiveUser = new AdaptiveUserLimiter({
+    baseIntervalMs: config.intervals.userMs,
+    maxInFlight: Math.max(2, config.pools.users.concurrency),
+    minInFlight: 1,
+    recoverStepMs: 3 * 60_000,
+    logger,
+  });
   const http = new HttpClient({
     cookie: config.cookie,
     userAgent: config.http.userAgent,
@@ -221,6 +248,7 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
     rateLimitBaseMs: config.http.rateLimitBaseMs,
     commentLimiter,
     userLimiter,
+    adaptiveUser,
     logger,
   });
 
@@ -244,26 +272,140 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
   await userWriter.startTimer();
 
   const uidSet = new UidSet();
-  const commentStats = new Map<
-    string,
-    { total: number; root: number; child: number }
-  >();
+  const commentStats = new Map<string, { total: number; root: number; child: number }>();
   const userQueue: string[] = [];
   const userResults = new Map<string, UserRecord>();
   let games: GameDictItem[] = [];
+
+  // ---- 用户阶段：评论期并行 + 令牌桶自适应 ----
+  const userInbox: string[] = [];
+  const userEnqueued = new Set<string>();
+  const userPlan = new Set<string>(); // 计划采集的全部 uid（含已完成）
+  let userWorkersStarted = false;
+  let commentsPhaseDone = false;
+  let userActive = 0;
+  let userFailedCount = 0;
+  let userLimitTarget = 0;
+
+  const processOneUser = async (uid: string): Promise<void> => {
+    if (controller?.isAborted || userResults.has(uid)) return;
+    await controller?.waitIfPaused();
+    const release = await adaptiveUser.acquire();
+    userActive++;
+    try {
+      const res = await http.getJson(userFullInfoUrl(uid), userLimiter, {
+        pool: 'user',
+        kind: 'user_full',
+        uid,
+        inFlight: adaptiveUser.inFlightLimit,
+      });
+      const data = (res as { data?: unknown }).data;
+      const cs = commentStats.get(uid) ?? { total: 0, root: 0, child: 0 };
+      const rec = mapUserRecord(data, {
+        uid,
+        comment_count: cs.total,
+        has_root: cs.root > 0,
+        has_child: cs.child > 0,
+        root_comment_count: cs.root,
+        child_comment_count: cs.child,
+        levelMin: config.users.levelMin,
+        gameName: (id) => games.find((g) => g.id === id)?.name ?? String(id),
+      });
+      userWriter.write(rec);
+      userResults.set(uid, rec);
+      checkpoint.users.done++;
+      // 分母=计划采集总数（已完成 + 待采集），随评论发现不断增长
+      const denom = Math.max(userPlan.size, userResults.size, 1);
+      logProgress(logger, '用户', '爬取', userResults.size, denom, { 用户数量: uidSet.size });
+      logProgress(logger, '用户', '写入', userResults.size, denom, { 用户数量: uidSet.size });
+      if (checkpoint.users.done % 20 === 0) {
+        await userWriter.flush();
+        await saveCp('users');
+      }
+    } catch (e) {
+      userFailedCount++;
+      logger.warn({
+        uid,
+        err: e instanceof Error ? e.message : String(e),
+        msg: 'user_fetch_failed',
+      });
+    } finally {
+      userActive--;
+      release();
+      syncStatus();
+    }
+  };
+
+  const startUserWorkers = () => {
+    if (userWorkersStarted || !usersEnabled) return;
+    userWorkersStarted = true;
+    const n = Math.max(2, config.pools.users.concurrency);
+    logger.info({ workers: n, msg: 'user_workers_started_early' });
+    for (let i = 0; i < n; i++) {
+      void (async () => {
+        while (true) {
+          if (controller?.isAborted) return;
+          const uid = userInbox.shift();
+          if (!uid) {
+            if (commentsPhaseDone && userActive === 0) return;
+            await sleep(30);
+            continue;
+          }
+          await processOneUser(uid);
+        }
+      })();
+    }
+  };
+
+  const enqueueUser = (uid: string) => {
+    if (!usersEnabled || !uid) return;
+    userPlan.add(uid);
+    if (userResults.has(uid) || userEnqueued.has(uid)) return;
+    const maxU = options.maxUsers ?? config.users.maxUsers;
+    if (maxU > 0 && userEnqueued.size >= maxU) return;
+    userEnqueued.add(uid);
+    userInbox.push(uid);
+    userLimitTarget = userPlan.size;
+  };
+
+  // 续爬：先装载已有 users 批次，避免把已完成用户重新入队（否则进度从 0 重计）
+  if (usersEnabled) {
+    await loadJsonlBatch<UserRecord>(usersBatchDir, 'users', (u) => {
+      if (u?.uid) {
+        userResults.set(u.uid, u);
+        userPlan.add(u.uid);
+      }
+    });
+    if (userResults.size > 0) {
+      logger.info({
+        alreadyFetchedUsers: userResults.size,
+        msg: 'user_batches_preloaded',
+      });
+    }
+  }
 
   // 恢复去重集合：从已有 comments 批次
   if (checkpoint.comments.written > 0 || options.resumeCheckpoint) {
     logger.info({ msg: 'rebuilding_uid_set_from_batches' });
     await loadJsonlBatch<CommentRecord>(commentsBatchDir, 'comments', (c) => {
       uidSet.add(c.uid);
+      enqueueUser(c.uid);
       const s = commentStats.get(c.uid) ?? { total: 0, root: 0, child: 0 };
       s.total++;
       if (c.comment_type === 'root') s.root++;
       else s.child++;
       commentStats.set(c.uid, s);
     });
-    logger.info({ size: uidSet.size, msg: 'uid_set_rebuilt' });
+    logger.info({
+      size: uidSet.size,
+      enqueued: userEnqueued.size,
+      alreadyFetchedUsers: userResults.size,
+      pendingUsers: Math.max(0, userEnqueued.size - userResults.size),
+      msg: 'uid_set_rebuilt',
+    });
+    if (usersEnabled && userEnqueued.size > 0) {
+      startUserWorkers();
+    }
   }
 
   const saveCp = async (phase: Checkpoint['phase']) => {
@@ -335,6 +477,9 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
     let pages = checkpoint.comments.rootPages;
     let isLast = checkpoint.comments.rootIsLast;
     const doneFloors = new Set(checkpoint.comments.childDoneFloors);
+    // 续爬时进度从已写入量起算，避免显示成从 0 重爬
+    let rootFetched = resumeLoaded ? Math.max(0, checkpoint.comments.written) : 0;
+    let commentTotalHint = 0;
 
     while (!isLast && pages < maxPages) {
       if (controller?.isAborted) break;
@@ -353,6 +498,7 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
         pages,
       });
       const page = extractReplyPage((res as { data?: unknown }).data);
+      commentTotalHint = Math.max(commentTotalHint, page.totalReplyNum || 0);
       logger.info({
         page: pages,
         lastIdIn: lastId,
@@ -368,7 +514,10 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
         if (!rec.uid) continue;
         commentWriter.write(rec);
         checkpoint.comments.written++;
+        rootFetched++;
         uidSet.add(rec.uid);
+        enqueueUser(rec.uid);
+        startUserWorkers();
         const s = commentStats.get(rec.uid) ?? { total: 0, root: 0, child: 0 };
         s.total++;
         s.root++;
@@ -393,6 +542,11 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
       checkpoint.comments.rootPages = pages;
       await commentWriter.flush();
       await saveCp('comments');
+      if (commentTotalHint > 0) {
+        const userCnt = { 用户数量: uidSet.size };
+        logProgress(logger, '评论', '爬取', rootFetched, commentTotalHint, userCnt);
+        logProgress(logger, '评论', '写入', checkpoint.comments.written, commentTotalHint, userCnt);
+      }
 
       if (page.list.length === 0) break;
     }
@@ -443,6 +597,8 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
             commentWriter.write(rec);
             checkpoint.comments.written++;
             uidSet.add(rec.uid);
+            enqueueUser(rec.uid);
+            startUserWorkers();
             const s = commentStats.get(rec.uid) ?? { total: 0, root: 0, child: 0 };
             s.total++;
             s.child++;
@@ -460,6 +616,12 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
         }
         doneFloors.add(task.floorId);
         checkpoint.comments.childDoneFloors = [...doneFloors];
+        const userCnt = { 用户数量: uidSet.size };
+        logProgress(logger, '评论', '爬取', commentPool.snapshot().done, childTasks.length, userCnt);
+        if (commentTotalHint > 0) {
+          const wTotal = Math.max(commentTotalHint, checkpoint.comments.written);
+          logProgress(logger, '评论', '写入', checkpoint.comments.written, wTotal, userCnt);
+        }
       });
       await commentWriter.flush();
       await saveCp('comments');
@@ -469,73 +631,51 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
     await commentWriter.close();
     logger.info({ written: commentWriter.writtenCount, msg: 'comment_writer_closed' });
 
-    // ---- 主页（可选）----
+    // ---- 主页（可选）：评论期已并行启动，此处等待队列清空 ----
     if (usersEnabled) {
-      await saveCp('users');
-      syncStatus();
-      // 先回填已有 users 批次，再计算 pending，避免重复爬
-      await loadJsonlBatch<UserRecord>(usersBatchDir, 'users', (u) => {
-        if (u?.uid) userResults.set(u.uid, u);
-      });
-      const allUids = uidSet.values();
-      const maxU = options.maxUsers ?? config.users.maxUsers;
-      const limited = allUids.slice(0, maxU > 0 ? maxU : allUids.length);
-      checkpoint.users.enqueued = limited.length;
-      const pending = limited.filter((u) => !userResults.has(u));
+      // 把尚未入队的 uid 补进队列（已完成的不会入队）
+      for (const uid of uidSet.values()) {
+        enqueueUser(uid);
+      }
+      userLimitTarget = userPlan.size;
+      checkpoint.users.enqueued = userEnqueued.size;
+      startUserWorkers();
+      commentsPhaseDone = true;
       logger.info({
-        totalUids: allUids.length,
-        alreadyDone: userResults.size,
-        pending: pending.length,
-        msg: 'user_phase_start',
+        inbox: userInbox.length,
+        done: userResults.size,
+        failed: userFailedCount,
+        plan: userPlan.size,
+        inFlight: adaptiveUser.inFlightLimit,
+        msg: 'user_phase_drain',
       });
 
-      const userPool = new TaskPool<string, void>({
-        concurrency: config.pools.users.concurrency,
-        logger,
-        name: 'users',
-      });
-      controller?.attachPools(null, userPool as TaskPool<unknown, unknown>);
-
-      await userPool.run(pending, async (uid) => {
-        if (controller?.isAborted) return;
-        await controller?.waitIfPaused();
-        const res = await http.getJson(userFullInfoUrl(uid), userLimiter, {
-          pool: 'user',
-          kind: 'user_full',
-          uid,
+      // 等待队列与在途任务结束
+      const deadline = Date.now() + 6 * 60 * 60 * 1000;
+      while (Date.now() < deadline) {
+        if (controller?.isAborted) break;
+        if (userInbox.length === 0 && userActive === 0) break;
+        await sleep(200);
+      }
+      if (userInbox.length || userActive) {
+        logger.warn({
+          inbox: userInbox.length,
+          active: userActive,
+          msg: 'user_drain_timeout',
         });
-        const data = (res as { data?: unknown }).data;
-        const cs = commentStats.get(uid) ?? { total: 0, root: 0, child: 0 };
-        const rec = mapUserRecord(data, {
-          uid,
-          comment_count: cs.total,
-          has_root: cs.root > 0,
-          has_child: cs.child > 0,
-          root_comment_count: cs.root,
-          child_comment_count: cs.child,
-          levelMin: config.users.levelMin,
-          gameName: (id) => games.find((g) => g.id === id)?.name ?? String(id),
-        });
-        userWriter.write(rec);
-        userResults.set(uid, rec);
-        checkpoint.users.done++;
-        syncStatus();
-        if (checkpoint.users.done % 20 === 0) {
-          await userWriter.flush();
-          await saveCp('users');
-        }
-      });
+      }
 
       await userWriter.close();
       await saveCp('users');
+      checkpoint.users.failed = userFailedCount;
       logger.info({
         done: checkpoint.users.done,
-        failed: checkpoint.users.failed + userPool.snapshot().failed,
+        failed: userFailedCount,
+        inFlightFinal: adaptiveUser.inFlightLimit,
         msg: 'user_phase_done',
       });
-      // 合并 pool failed count
-      checkpoint.users.failed = userPool.snapshot().failed;
     } else {
+      commentsPhaseDone = true;
       logger.info({ msg: 'user_phase_skipped_disabled' });
     }
 
@@ -641,6 +781,20 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
       logger.info({ msg: 'auto_analysis_skipped' });
     }
   } catch (e) {
+    const aborted =
+      controller?.isAborted ||
+      (e instanceof Error && (e.message === 'pool_aborted' || e.message.includes('abort')));
+    if (aborted) {
+      await saveCp('paused').catch(() => undefined);
+      logger.warn({
+        err: e instanceof Error ? e.message : String(e),
+        phase: checkpoint.phase,
+        commentsWritten: checkpoint.comments.written,
+        rootLastId: checkpoint.comments.rootLastId,
+        msg: 'crawl_interrupted',
+      });
+      throw e;
+    }
     await saveCp('failed').catch(() => undefined);
     logger.error({
       err: e instanceof Error ? e.message : String(e),

@@ -56,6 +56,7 @@ export function rotateHistory(logDir: string, historyDays = 3, timezoneOffsetHou
   }
 }
 
+/** 控制台仅输出 WARN/ERROR，以及进度行（msg=progress 且带 progressText） */
 function consoleStream(level: string, tzHours: number): pino.StreamEntry {
   return {
     level: level as pino.Level,
@@ -63,23 +64,32 @@ function consoleStream(level: string, tzHours: number): pino.StreamEntry {
       write(msg: string) {
         try {
           const obj = JSON.parse(msg) as Record<string, unknown>;
+          const lv = String(obj.level ?? 'info').toUpperCase();
+          const isProgress = obj.msg === 'progress' && typeof obj.progressText === 'string';
+
+          // 非进度且非 WARN/ERROR → 终端静默（文件日志仍全量）
+          if (!isProgress && lv !== 'WARN' && lv !== 'WARNING' && lv !== 'ERROR' && lv !== 'FATAL') {
+            return;
+          }
+
+          if (isProgress) {
+            process.stdout.write(`${String(obj.progressText)}\n`);
+            return;
+          }
+
           let t: string;
           if (typeof obj.time === 'string') {
-            // pino isoTime 是 UTC ISO；转到配置时区
             const ms = Date.parse(obj.time);
-            t = Number.isNaN(ms)
-              ? obj.time.slice(11, 23)
-              : formatTimeInOffset(new Date(ms), tzHours);
+            t = Number.isNaN(ms) ? obj.time.slice(11, 23) : formatTimeInOffset(new Date(ms), tzHours);
           } else if (typeof obj.time === 'number') {
             t = formatTimeInOffset(new Date(obj.time), tzHours);
           } else {
             t = formatTimeInOffset(new Date(), tzHours);
           }
-          const lv = String(obj.level ?? 'info').toUpperCase();
-          const base = `[${t}] ${lv} run=${obj.runId ?? '-'} ${obj.msg ?? ''}`;
+          const base = `[${t}] ${lv} ${obj.msg ?? ''}`;
           const extras: string[] = [];
           for (const [k, v] of Object.entries(obj)) {
-            if (['time', 'level', 'msg', 'runId', 'pid', 'hostname'].includes(k)) continue;
+            if (['time', 'level', 'msg', 'runId', 'pid', 'hostname', 'progressText'].includes(k)) continue;
             if (v === undefined) continue;
             extras.push(`${k}=${typeof v === 'object' ? JSON.stringify(v) : String(v)}`);
           }
@@ -92,6 +102,38 @@ function consoleStream(level: string, tzHours: number): pino.StreamEntry {
       },
     } as unknown as NodeJS.WritableStream,
   };
+}
+
+export function formatProgress(
+  phase: '评论' | '用户' | string,
+  stage: '爬取' | '写入',
+  current: number,
+  total: number,
+  extra?: { 用户数量?: number },
+): string {
+  const pct = total > 0 ? ((current / total) * 100).toFixed(1) : '0.0';
+  const suffix =
+    extra && typeof extra['用户数量'] === 'number' ? ` <用户数量：${extra['用户数量']}>` : '';
+  return `【目前状态：${phase} | ${stage}】 进度：${current} / ${total} | ${pct} %${suffix}`;
+}
+
+export function logProgress(
+  logger: Logger,
+  phase: '评论' | '用户' | string,
+  stage: '爬取' | '写入',
+  current: number,
+  total: number,
+  extra?: { 用户数量?: number },
+): void {
+  logger.info({
+    msg: 'progress',
+    progressPhase: phase,
+    progressStage: stage,
+    progressCurrent: current,
+    progressTotal: total,
+    progressUsers: extra?.['用户数量'],
+    progressText: formatProgress(phase, stage, current, total, extra),
+  });
 }
 
 /** 自定义 timestamp：在 JSON time 字段写入带偏移的墙钟时间（含 offset 标签） */
