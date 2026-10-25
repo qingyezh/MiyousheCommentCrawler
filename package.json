@@ -1,0 +1,30 @@
+{
+  "name": "miyoushe-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node app/dist/index.js",
+    "crawl": "pnpm run build && node app/dist/index.js crawl",
+    "resume": "pnpm run build && node app/dist/index.js resume",
+    "report": "pnpm run build && node app/dist/index.js report",
+    "analysis": "pnpm run build && node app/dist/index.js analysis",
+    "clean:data": "pnpm run build && node app/dist/app/scripts/clean.js",
+    "smoke": "pnpm run build && node app/dist/app/scripts/smoke.js"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "exceljs": "^4.4.0",
+    "pino": "^9.6.0",
+    "undici": "^7.4.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

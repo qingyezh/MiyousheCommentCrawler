@@ -1,0 +1,25 @@
+# 复制为 config.yaml 后填写；config.yaml 不会被提交
+# 或设置环境变量 MIYOUSHE_COOKIE 优先生效
+
+cookie: "cookie_token=...; account_id=...; ltoken=...; ..."
+
+# 目标与一键参数：改这里后直接 pnpm run crawl
+crawl:
+  url: "https://www.miyoushe.com/ys/article/79085282"
+  users: true                 # 是否爬用户主页
+  includeChild: true          # 是否爬二级评论
+  maxRootPages: 0             # 0=不限制
+  maxUsers: 0                 # 0=不限制
+  purgeBatches: false
+  analysis: true              # 爬完自动分析出图
+
+# 可选覆盖
+# intervals:
+#   commentMs: 1200
+#   userMs: 800
+# http:
+#   rateLimitMaxRetries: 6
+#   rateLimitBaseMs: 1000
+# log:
+#   timezoneOffset: "UTC+8"
+#   level: debug

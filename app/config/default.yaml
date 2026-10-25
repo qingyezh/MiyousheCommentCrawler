@@ -1,0 +1,63 @@
+# 默认配置（可被 config.yaml / 环境变量覆盖）
+# cookie 建议写在 config.yaml 或 MIYOUSHE_COOKIE，不要提交到 git
+
+cookie: ""
+
+http:
+  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  timeoutMs: 20000
+  globalQps: 5
+  retry: 3
+  backoffBaseMs: 500
+  rateLimitMaxRetries: 6   # 限流最多重试 6 次
+  rateLimitBaseMs: 1000    # 斐波那契退避基数：1s,1s,2s,3s,5s,8s
+
+# 请求间隔（毫秒）
+intervals:
+  commentMs: 1200   # 评论区：1.2s
+  userMs: 800       # 主页：0.8s
+
+pools:
+  comments:
+    concurrency: 2
+  users:
+    concurrency: 2
+
+replies:
+  pageSize: 20
+  orderType: 1
+  includeChild: true
+  childPageSize: 10
+  childMaxPerFloor: 50
+
+users:
+  enabled: false          # 默认关闭主页爬取；CLI --users 可打开
+  levelMin: 2
+  maxUsers: 2000
+
+io:
+  batchSize: 50
+  flushIntervalMs: 2000
+  purgeBatchesOnSuccess: false
+  dataDir: app/data
+  logDir: app/log
+
+log:
+  level: info
+  historyDays: 3          # 启动时把 3 天前日志挪到 app/log/history/
+  timezoneOffset: "UTC+8" # 日志时间偏移：UTC / utc / UTC+0 ~ UTC+23；非法值回落 UTC
+
+control:
+  enable: false
+  port: 8787
+
+# 一键运行：改这里后直接 pnpm run crawl
+# CLI 参数（--url / --users 等）优先级高于本节
+crawl:
+  url: ""                          # 必填目标帖，例如 https://www.miyoushe.com/ys/article/79085282
+  users: false                     # 是否爬用户主页（游戏游玩率）
+  includeChild: true               # 是否爬二级评论
+  maxRootPages: 0                  # 0 = 不限制
+  maxUsers: 0                      # 0 = 不限制
+  purgeBatches: false              # 成功后是否删除批次临时文件
+  analysis: true                   # 爬完后自动分析出图；--ana true/false 可覆盖

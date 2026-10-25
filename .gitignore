@@ -1,0 +1,9 @@
+node_modules/
+app/dist/
+app/data/
+app/log/
+app/config/config.yaml
+*.log
+.DS_Store
+*.tmp
+.mimocode
