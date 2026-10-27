@@ -365,6 +365,96 @@ async function saveChart(
   return { svgPath, pngPath };
 }
 
+// ---------- 标题空文件标记 ----------
+
+/** 将标题转为合法文件名段（去掉路径非法字符） */
+export function sanitizeTitleFilename(title: string): string {
+  return String(title)
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .slice(0, 120) || 'untitled';
+}
+
+/**
+ * 在数据根目录（results/<postId>/）写入空文件 `.<标题>`。
+ * 若存在旧的 `.` 标题文件且名称不同，会删除旧文件避免混淆。
+ */
+export async function writeTitleMarkerFile(
+  resultsDir: string,
+  title: string,
+  logger?: Logger,
+): Promise<string> {
+  await fsp.mkdir(resultsDir, { recursive: true });
+  const safe = sanitizeTitleFilename(title);
+  const target = path.join(resultsDir, `.${safe}`);
+
+  // 清理旧标题标记（同目录下以 . 开头且不是目录的文件）
+  try {
+    for (const name of await fsp.readdir(resultsDir)) {
+      if (name.startsWith('.') && name !== target && !name.startsWith('..')) {
+        const p = path.join(resultsDir, name);
+        const st = await fsp.stat(p).catch(() => null);
+        if (st?.isFile()) {
+          await fsp.rm(p, { force: true });
+          logger?.info({ removed: name, msg: 'title_marker_removed_stale' });
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  if (!fs.existsSync(target)) {
+    await fsp.writeFile(target, '', 'utf8');
+    logger?.info({ title: safe, path: target, msg: 'title_marker_created' });
+  } else {
+    // 确保是空文件
+    await fsp.writeFile(target, '', 'utf8');
+  }
+  return target;
+}
+
+/** 从 post_meta / summary 读取标题 */
+export async function readPostTitle(resultsDir: string): Promise<string | null> {
+  const postMeta = path.join(resultsDir, 'post_meta.json');
+  if (fs.existsSync(postMeta)) {
+    try {
+      const p = JSON.parse(await fsp.readFile(postMeta, 'utf8')) as { subject?: string; post_id?: string };
+      if (p.subject) return p.subject;
+    } catch {
+      /* ignore */
+    }
+  }
+  const summary = path.join(resultsDir, 'summary.json');
+  if (fs.existsSync(summary)) {
+    try {
+      const s = JSON.parse(await fsp.readFile(summary, 'utf8')) as {
+        post?: { subject?: string; post_id?: string };
+      };
+      if (s.post?.subject) return s.post.subject;
+    } catch {
+      /* ignore */
+    }
+  }
+  // 帖子基本信息.csv 第一行后的标题列
+  const csv = path.join(resultsDir, '帖子基本信息.csv');
+  if (fs.existsSync(csv)) {
+    try {
+      const text = await fsp.readFile(csv, 'utf8');
+      const line = text.replace(/^﻿/, '').split(/\r?\n/)[1];
+      if (line) {
+        const cols = line.split(',');
+        // 列: 帖子ID,标题,...
+        if (cols[1]) return cols[1].replace(/^"|"$/g, '');
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
 // ---------- 主分析 ----------
 
 export async function runAnalysis(input: AnalysisInput, logger: Logger): Promise<AnalysisResult> {
@@ -372,6 +462,18 @@ export async function runAnalysis(input: AnalysisInput, logger: Logger): Promise
   const chartsDir = path.join(outDir, 'charts');
   const svgDir = path.join(chartsDir, 'svg');
   await fsp.mkdir(svgDir, { recursive: true });
+
+  // 数据根目录写入空标题标记文件
+  if (input.post.subject) {
+    try {
+      await writeTitleMarkerFile(input.resultsDir, input.post.subject, logger);
+    } catch (e) {
+      logger.warn({
+        err: e instanceof Error ? e.message : String(e),
+        msg: 'title_marker_failed',
+      });
+    }
+  }
 
   const games = ensureGames(input.games, input.users);
   const uniqueCommenters = new Set(input.comments.map((c) => c.uid).filter(Boolean)).size;

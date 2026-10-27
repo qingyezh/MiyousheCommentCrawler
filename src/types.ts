@@ -34,6 +34,17 @@ export interface AppConfig {
     enabled: boolean;
     levelMin: number;
     maxUsers: number;
+    /** 用户阶段自适应并发 */
+    concurrency: {
+      /** 1–4 并发占比（归一化后使用） */
+      weights: Record<string, number>;
+      /** 限流恢复后允许爬升到 3–4；默认 false：3–4 权重并入 1，恢复后停在 2 */
+      allowHighAfterRecover: boolean;
+      /** 降到 1 后无新限流则恢复双并发的间隔 ms */
+      recoverStepMs: number;
+      /** 1 人档再限流 → 暂停 ms */
+      pauseOnDoubleFailMs: number;
+    };
   };
   io: {
     batchSize: number;
@@ -64,6 +75,20 @@ export interface AppConfig {
     purgeBatches: boolean;
     /** 爬完后是否自动分析出图；CLI --ana 可覆盖 */
     analysis: boolean;
+  };
+  /** 实时监控；CLI 参数优先于该配置。url 默认复用 crawl.url */
+  monitor: {
+    url: string;
+    /** 采样间隔秒，默认 2 */
+    intervalSec: number;
+    /** 浏览器 UI 端口 */
+    port: number;
+    /** 终端 sparkline */
+    sparkline: boolean;
+    /** 环形窗口点数 */
+    window: number;
+    /** 最多保留点数 */
+    maxPoints: number;
   };
 }
 

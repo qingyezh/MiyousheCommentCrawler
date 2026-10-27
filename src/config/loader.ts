@@ -48,6 +48,22 @@ const configSchema = z.object({
       enabled: z.boolean().default(false),
       levelMin: z.number().int().min(1).default(2),
       maxUsers: z.number().int().min(0).default(2000),
+      concurrency: z
+        .object({
+          weights: z
+            .object({
+              1: z.number().min(0).default(0.2),
+              2: z.number().min(0).default(0.4),
+              3: z.number().min(0).default(0.25),
+              4: z.number().min(0).default(0.15),
+            })
+            .partial()
+            .default({ 1: 0.2, 2: 0.4, 3: 0.25, 4: 0.15 }),
+          allowHighAfterRecover: z.boolean().default(false),
+          recoverStepMs: z.number().int().min(1000).default(180000),
+          pauseOnDoubleFailMs: z.number().int().min(1000).default(180000),
+        })
+        .default({}),
     })
     .default({}),
   io: z
@@ -90,6 +106,16 @@ const configSchema = z.object({
       maxUsers: z.number().int().min(0).default(0),
       purgeBatches: z.boolean().default(false),
       analysis: z.boolean().default(true),
+    })
+    .default({}),
+  monitor: z
+    .object({
+      url: z.string().default(''),
+      intervalSec: z.number().min(0.5).default(2),
+      port: z.number().int().min(1).max(65535).default(18765),
+      sparkline: z.boolean().default(false),
+      window: z.number().int().min(10).default(180),
+      maxPoints: z.number().int().min(10).default(5000),
     })
     .default({}),
 });

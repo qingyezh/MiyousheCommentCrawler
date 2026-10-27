@@ -13,6 +13,15 @@ crawl:
   purgeBatches: false
   analysis: true              # 爬完自动分析出图
 
+# 实时监控：pnpm run monitor（url 为空则用 crawl.url）
+monitor:
+  url: ""
+  intervalSec: 2
+  port: 18765
+  sparkline: false
+  window: 180
+  maxPoints: 5000
+
 # 可选覆盖
 # intervals:
 #   commentMs: 1200

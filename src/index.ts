@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, projectRootFrom } from './config/loader.js';
 import { createLogger, rotateHistory } from './logger/index.js';
 import { runCrawl, runReportOnly, SimpleCrawlController, type CrawlContext } from './pipeline/crawler.js';
-import { runAnalysisById, runPartialAnalysis } from './pipeline/analysis.js';
+import { runAnalysisById, runPartialAnalysis, readPostTitle, writeTitleMarkerFile, resolveResultsDir } from './pipeline/analysis.js';
+import { runMonitor } from './pipeline/monitor.js';
 import { startControlServer } from './core/control.js';
 import type { CrawlOptions } from './types.js';
 
@@ -304,8 +305,50 @@ async function main() {
     return;
   }
 
+  if (cmd === 'monitor' || cmd === 'mon') {
+    const posUrl = _[0];
+    const url = (str(flags.url) ?? posUrl ?? config.monitor.url ?? config.crawl.url ?? '').trim();
+    if (!url) {
+      console.error('用法: pnpm run monitor -- --url "https://www.miyoushe.com/ys/article/xxx" [--interval 2]');
+      console.error('或在 app/config/config.yaml 的 monitor.url / crawl.url 中配置目标帖');
+      process.exit(2);
+    }
+    const intervalSec = num(flags.interval, config.monitor.intervalSec) ?? config.monitor.intervalSec;
+    await runMonitor(
+      {
+        url,
+        intervalMs: Math.round(intervalSec * 1000),
+        window: num(flags.window, config.monitor.window) ?? config.monitor.window,
+        maxPoints: num(flags.max, config.monitor.maxPoints) ?? config.monitor.maxPoints,
+        port: num(flags.port, config.monitor.port) ?? config.monitor.port,
+        sparkline: parseBoolFlag(flags.sparkline) ?? config.monitor.sparkline,
+      },
+      { config, logger, projectRoot },
+    );
+    if (control) await control.close();
+    return;
+  }
+
+  if (cmd === 'reset-title' || cmd === 'Reset-Title' || cmd === 'reset_title') {
+    const idRaw = str(flags.id) ?? _[0] ?? config.crawl.url?.split('/').filter(Boolean).pop();
+    if (!idRaw) {
+      console.error('用法: pnpm run Reset-Title -- --id 79085282');
+      process.exit(2);
+    }
+    const resultsDir = resolveResultsDir(idRaw, projectRoot, dataDir);
+    const title = str(flags.title) ?? (await readPostTitle(resultsDir));
+    if (!title) {
+      console.error(`未能从 ${resultsDir} 读取标题，请用 --title "标题" 指定`);
+      process.exit(2);
+    }
+    const file = await writeTitleMarkerFile(resultsDir, title, logger);
+    console.log(`标题空文件已重建: ${file}`);
+    if (control) await control.close();
+    return;
+  }
+
   logger.error({ cmd, msg: 'unknown_cmd' });
-  console.error('未知命令。可用: crawl | resume | report | analysis | partial | clean');
+  console.error('未知命令。可用: crawl | resume | report | analysis | partial | monitor | reset-title | clean');
   process.exit(2);
 }
 

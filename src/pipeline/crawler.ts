@@ -229,13 +229,24 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
   checkpoint.users.enabled = usersEnabled;
 
   const commentLimiter = new RateLimiter(config.intervals.commentMs);
-  const userLimiter = new RateLimiter(config.intervals.userMs);
-  // 用户阶段保守自适应：初始 2 人，限流回退 1 人，再限流暂停 3 分钟后恢复
+  // 用户侧：实际间隔与并发由 AdaptiveUserLimiter 令牌桶控制；
+  // HttpClient 再用串行 RateLimiter 会把并发打回 1，故用 0ms 直通 limiter
+  const userLimiter = new RateLimiter(0);
+  // 用户阶段：1–4 占比自适应；限流降 1；再限流暂停；无新限流恢复双并发（默认不升 3–4）
+  const w = config.users.concurrency?.weights ?? { 1: 0.2, 2: 0.4, 3: 0.25, 4: 0.15 };
+  const weightsNum: Record<number, number> = {};
+  for (const [k, v] of Object.entries(w)) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 0) weightsNum[Number(k)] = n;
+  }
   const adaptiveUser = new AdaptiveUserLimiter({
     baseIntervalMs: config.intervals.userMs,
-    maxInFlight: Math.max(2, config.pools.users.concurrency),
-    minInFlight: 1,
-    recoverStepMs: 3 * 60_000,
+    concurrency: {
+      weights: weightsNum,
+      allowHighAfterRecover: config.users.concurrency?.allowHighAfterRecover ?? false,
+      recoverStepMs: config.users.concurrency?.recoverStepMs ?? 180_000,
+      pauseOnDoubleFailMs: config.users.concurrency?.pauseOnDoubleFailMs ?? 180_000,
+    },
     logger,
   });
   const http = new HttpClient({
@@ -339,7 +350,7 @@ export async function runCrawl(ctx: CrawlContext, controller?: SimpleCrawlContro
   const startUserWorkers = () => {
     if (userWorkersStarted || !usersEnabled) return;
     userWorkersStarted = true;
-    const n = Math.max(2, config.pools.users.concurrency);
+    const n = Math.max(4, config.pools.users.concurrency);
     logger.info({ workers: n, msg: 'user_workers_started_early' });
     for (let i = 0; i < n; i++) {
       void (async () => {

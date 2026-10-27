@@ -58,6 +58,22 @@ CSV 均为 UTF-8 BOM + 中文列名。同时会在 `app/data/runs/<runId>/final/
 
 `总结统计.csv` / `分析汇总.csv` 同时写入 `_0` 与 `_1` 两套百分比。
 
+## 实时监控（浏览器曲线）
+
+```powershell
+pnpm run monitor -- --url "https://www.miyoushe.com/ys/article/xxx" --interval 2
+```
+
+- 每 2 秒拉取浏览/点赞/评论
+- 终端打印数值与 sparkline
+- 浏览器打开 `http://127.0.0.1:18765/` 看实时曲线 + 增长曲线
+- 结束（Ctrl+C）后默认导出：
+  - `app/data/results/<id>/monitor/原始曲线.svg`
+  - `app/data/results/<id>/monitor/增长曲线.svg`
+  - `app/data/results/<id>/monitor/时间序列.csv`
+
+可选参数：`--port 18765` `--window 180` `--max 5000`
+
 ## 中途快照分析
 
 爬取进行中可另开终端生成临时分析（**不改 checkpoint**，不影响 crawl/resume）：

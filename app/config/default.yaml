@@ -14,8 +14,8 @@ http:
 
 # 请求间隔（毫秒）
 intervals:
-  commentMs: 1000   # 评论区：1.2s
-  userMs: 900       # 主页：0.8s
+  commentMs: 1000   # 评论区
+  userMs: 200       # 主页
 
 pools:
   comments:
@@ -34,6 +34,19 @@ users:
   enabled: false          # 默认关闭主页爬取；CLI --users 可打开
   levelMin: 2
   maxUsers: 50000
+  concurrency:
+    # 1–4 并发占比（会归一化）；默认关闭爬升 3–4 时，3/4 权重并入 1
+    weights:
+      1: 0.2
+      2: 0.45
+      3: 0.3
+      4: 0.05
+    # 限流恢复后是否允许再爬升到 3–4（默认关闭：恢复后停在双并发 2）
+    allowHighAfterRecover: false
+    # 降到 1 人后，若一段时间无新限流则恢复双并发
+    recoverStepMs: 180000
+    # 1 人档再次限流 → 暂停用户爬取
+    pauseOnDoubleFailMs: 180000
 
 io:
   batchSize: 50
@@ -61,3 +74,13 @@ crawl:
   maxUsers: 0                      # 0 = 不限制
   purgeBatches: false              # 成功后是否删除批次临时文件
   analysis: true                   # 爬完后自动分析出图；--ana true/false 可覆盖
+
+# 实时监控：pnpm run monitor
+# CLI 参数（--url / --interval 等）优先级高于本节；url 为空时复用 crawl.url
+monitor:
+  url: ""                          # 监控目标；留空则用 crawl.url
+  intervalSec: 2                   # 采样间隔（秒）
+  port: 18765                      # 浏览器本地 UI 端口
+  sparkline: false                 # 终端 sparkline，默认关闭
+  window: 7200                     # 浏览器/终端曲线窗口点数
+  maxPoints: 500000                # 内存与导出最多保留点数
